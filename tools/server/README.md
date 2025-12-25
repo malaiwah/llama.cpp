@@ -1492,6 +1492,7 @@ We also offer additional options that are exclusive to presets (these aren't tre
   - Example: `kv-cache-persist-path = /var/cache/llama/{model_name}.kvcache`
 - `no-kv-cache-on-unload` (boolean): Disable saving KV cache when this model is unloaded (default: save enabled)
 - `no-kv-cache-on-load` (boolean): Disable restoring KV cache when this model is loaded (default: restore enabled)
+- `pin` (boolean): Prevents the router from unloading this model when the `models_max` limit is exceeded; the model remains loaded until explicitly unloaded or the server restarts.
 
 ### Routing requests
 
