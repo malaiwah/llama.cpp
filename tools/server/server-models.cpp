@@ -777,6 +777,96 @@ void server_models_routes::init_routes() {
         return proxy_get(req);
     };
 
+    this->get_router_metrics = [this](const server_http_req & /*req*/) {
+        auto res = std::make_unique<server_http_res>();
+        res->content_type = "text/plain; version=0.0.4; charset=utf-8";
+
+        std::stringstream metrics_output;
+        auto all_models = models.get_all_meta();
+
+        // Query metrics from each loaded model instance
+        for (const auto & meta : all_models) {
+            if (meta.status != SERVER_MODEL_STATUS_LOADED) {
+                continue; // Skip unloaded models
+            }
+
+            try {
+                // Create HTTP client to query child metrics endpoint
+                httplib::Client cli(CHILD_ADDR, meta.port);
+                cli.set_connection_timeout(0, 500000); // 500ms timeout
+
+                auto child_res = cli.Get("/metrics");
+                if (child_res && child_res->status == 200) {
+                    // Parse and relabel the Prometheus metrics
+                    std::istringstream iss(child_res->body);
+                    std::string line;
+                    while (std::getline(iss, line)) {
+                        // Skip empty lines and comments
+                        if (line.empty() || line[0] == '#') {
+                            metrics_output << line << '\n';
+                            continue;
+                        }
+
+                        // Parse metric line: name{labels} value timestamp
+                        size_t brace_pos = line.find('{');
+                        size_t space_pos = line.find(' ', brace_pos);
+
+                        if (brace_pos != std::string::npos && space_pos != std::string::npos) {
+                            // Has existing labels, add our labels
+                            std::string metric_name = line.substr(0, brace_pos);
+                            std::string existing_labels = line.substr(brace_pos, space_pos - brace_pos);
+                            std::string value_and_timestamp = line.substr(space_pos);
+
+                            // Remove closing brace from existing labels and add our labels
+                            if (!existing_labels.empty() && existing_labels.back() == '}') {
+                                existing_labels.pop_back();
+                                if (existing_labels.size() > 1) { // More than just '{'
+                                    existing_labels += ",";
+                                }
+                            }
+                            existing_labels += "model=\"" + meta.name + "\",port=\"" + std::to_string(meta.port) + "\",status=\"loaded\"}";
+
+                            metrics_output << metric_name << existing_labels << value_and_timestamp << '\n';
+                        } else if (space_pos != std::string::npos) {
+                            // No existing labels, add our labels
+                            std::string metric_name = line.substr(0, space_pos);
+                            std::string value_and_timestamp = line.substr(space_pos);
+
+                            metrics_output << metric_name << "{model=\"" << meta.name << "\",port=\"" << meta.port << "\",status=\"loaded\"}" << value_and_timestamp << '\n';
+                        } else {
+                            // Malformed line, pass through unchanged
+                            metrics_output << line << '\n';
+                        }
+                    }
+                } else {
+                    // Child server not responding, add error metrics
+                    metrics_output << "# Child server " << meta.name << " on port " << meta.port << " is not responding\n";
+                    metrics_output << "llama_router_child_status{model=\"" << meta.name << "\",port=\"" << meta.port << "\",status=\"error\"} 0\n";
+                }
+            } catch (const std::exception & e) {
+                // HTTP client error, add error metrics
+                metrics_output << "# Child server " << meta.name << " on port " << meta.port << " error: " << e.what() << "\n";
+                metrics_output << "llama_router_child_status{model=\"" << meta.name << "\",port=\"" << meta.port << "\",status=\"error\"} 0\n";
+            }
+        }
+
+        // Add router-level metrics
+        metrics_output << "# Router-level metrics\n";
+        metrics_output << "llama_router_models_total " << all_models.size() << '\n';
+
+        size_t loaded_count = 0;
+        for (const auto & meta : all_models) {
+            if (meta.status == SERVER_MODEL_STATUS_LOADED) {
+                loaded_count++;
+            }
+        }
+        metrics_output << "llama_router_models_loaded " << loaded_count << '\n';
+
+        res->status = 200;
+        res->data = metrics_output.str();
+        return res;
+    };
+
     this->proxy_get = [this](const server_http_req & req) {
         std::string method = "GET";
         std::string name = req.get_param("model");

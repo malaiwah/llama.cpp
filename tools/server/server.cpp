@@ -134,7 +134,7 @@ int main(int argc, char ** argv, char ** envp) {
 
         // proxy handlers
         // note: routes.get_health stays the same
-        routes.get_metrics                 = models_routes->proxy_get;
+        routes.get_metrics                 = models_routes->get_router_metrics;
         routes.post_props                  = models_routes->proxy_post;
         routes.get_api_show                = models_routes->proxy_get;
         routes.post_completions            = models_routes->proxy_post;
