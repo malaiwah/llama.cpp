@@ -809,9 +809,9 @@ void server_models_routes::init_routes() {
 
                         // Parse metric line: name{labels} value timestamp
                         size_t brace_pos = line.find('{');
-                        size_t space_pos = line.find(' ', brace_pos);
+                        size_t space_pos = line.find(' ');
 
-                        if (brace_pos != std::string::npos && space_pos != std::string::npos) {
+                        if (brace_pos != std::string::npos && brace_pos < space_pos) {
                             // Has existing labels, add our labels
                             std::string metric_name = line.substr(0, brace_pos);
                             std::string existing_labels = line.substr(brace_pos, space_pos - brace_pos);
