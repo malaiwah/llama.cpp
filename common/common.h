@@ -499,6 +499,9 @@ struct common_params {
     std::string models_preset = ""; // directory containing model presets for the router server
     int models_max = 4;             // maximum number of models to load simultaneously
     bool models_autoload = true;    // automatically load models when requested via the router server
+    bool models_preset_watch = false; // watch models_preset file for changes and reload automatically
+    int models_preset_watch_interval = 5; // interval in seconds for config file polling
+    int models_recycle_idle_seconds = 5;  // idle timeout in seconds before recycling models with changed configs
 
     bool log_json = false;
 

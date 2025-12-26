@@ -1440,6 +1440,91 @@ llama-server --models-preset ./my-models.ini
 
 Each section in the file defines a new preset. Keys within a section correspond to command-line arguments (without leading dashes). For example, the argument `--n-gpu-layers 123` is written as `n-gpu-layers = 123`.
 
+#### Hot-reloading preset configuration
+
+You can enable automatic hot-reloading of the preset configuration file by using the `--models-preset-watch` flag:
+
+```sh
+llama-server --models-preset ./my-models.ini --models-preset-watch
+```
+
+When enabled, the router server will monitor the preset file for changes and automatically reload the configuration when it detects modifications. This allows you to add, remove, or update model configurations without restarting the server.
+
+**Configuration options:**
+
+- `--models-preset-watch-interval SECONDS`: Set the polling interval for checking config file changes (default: 5 seconds)
+- `--models-recycle-idle-seconds SECONDS`: Set the idle timeout before recycling models with changed configurations (default: 5 seconds)
+
+**Important notes about hot-reloading:**
+
+- Only models defined in the preset file are affected; models from cache or `--models-dir` are not reloaded
+- **Graceful recycling of models with changed configurations:**
+  - When a model's configuration changes in the preset file, it is marked for recycling
+  - The model continues running and processing requests while marked for recycling
+  - Once the model has been idle for the configured timeout (default: 5 seconds), it is gracefully unloaded
+  - On the next request to that model, it will be reloaded with the new configuration
+  - Models actively processing requests are never recycled mid-request
+  - Pinned models (with `pin = true`) are exempt from automatic recycling
+- **Models removed from configuration**: Models that are no longer in the config file will be unloaded automatically
+- **Models newly added to configuration**: New models will be available but won't load automatically unless they have `load-on-startup` set
+- **Error handling**: If the configuration file contains errors after a change, the reload will fail and the previous configuration remains active. Check the server logs for error details.
+
+**Metrics monitoring:**
+
+You can monitor configuration and recycling status via the `/metrics` endpoint:
+
+- `llama_router_config_last_modified`: Unix timestamp of when the config file was last modified
+- `llama_router_config_last_loaded`: Unix timestamp of when the config was last successfully loaded
+- `llama_router_models_pending_recycle`: Number of models currently marked for recycling
+
+**Checking recycling status:**
+
+The `/models` endpoint includes a `recycle_pending` field in the status object for models marked for recycling:
+
+```json
+{
+  "id": "my-model",
+  "status": {
+    "value": "loaded",
+    "recycle_pending": true,
+    ...
+  }
+}
+```
+
+**Example workflow:**
+
+1. Start the server with watch mode enabled:
+   ```sh
+   llama-server --models-preset ./my-models.ini --models-preset-watch --models-recycle-idle-seconds 10
+   ```
+
+2. Edit `my-models.ini` to modify a model's settings (e.g., change `n-gpu-layers`)
+
+3. The server detects the change and marks the model for recycling:
+   ```
+   srv  config_watch: config file my-models.ini has been modified, initiating reload...
+   srv  config_watch: model my-model configuration changed, marked for recycling
+   srv  config_watch: config reload completed successfully
+   ```
+
+4. The model continues serving requests. Once idle for 10 seconds, it is gracefully unloaded:
+   ```
+   srv  config_watch: recycling idle model my-model
+   srv  config_watch: model my-model unloaded successfully
+   ```
+
+5. On the next request to `my-model`, it is reloaded with the new configuration
+
+6. Monitor recycling status:
+   ```sh
+   # Check models endpoint for recycle_pending status
+   curl http://localhost:8080/models | jq '.data[] | select(.status.recycle_pending == true)'
+
+   # Check metrics for pending recycling count
+   curl http://localhost:8080/metrics | grep llama_router_models_pending_recycle
+   ```
+
 Short argument forms (e.g., `c`, `ngl`) and environment variable names (e.g., `LLAMA_ARG_N_GPU_LAYERS`) are also supported as keys.
 
 Example:

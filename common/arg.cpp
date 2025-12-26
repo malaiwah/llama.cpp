@@ -2812,6 +2812,28 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MODELS_AUTOLOAD"));
     add_opt(common_arg(
+        {"--models-preset-watch"},
+        {"--no-models-preset-watch"},
+        string_format("for router server, watch models_preset file for changes and reload automatically (default: %s)", params.models_preset_watch ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.models_preset_watch = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MODELS_PRESET_WATCH"));
+    add_opt(common_arg(
+        {"--models-preset-watch-interval"}, "SECONDS",
+        string_format("for router server, interval in seconds for config file polling (default: %d)", params.models_preset_watch_interval),
+        [](common_params & params, int value) {
+            params.models_preset_watch_interval = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MODELS_PRESET_WATCH_INTERVAL"));
+    add_opt(common_arg(
+        {"--models-recycle-idle-seconds"}, "SECONDS",
+        string_format("for router server, idle timeout in seconds before recycling models with changed configs (default: %d)", params.models_recycle_idle_seconds),
+        [](common_params & params, int value) {
+            params.models_recycle_idle_seconds = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MODELS_RECYCLE_IDLE_SECONDS"));
+    add_opt(common_arg(
         {"--jinja"},
         {"--no-jinja"},
         string_format("whether to use jinja template engine for chat (default: %s)", params.use_jinja ? "enabled" : "disabled"),

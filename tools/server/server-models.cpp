@@ -136,6 +136,10 @@ server_models::server_models(
         LOG_WRN("using original argv[0] as fallback: %s\n", argv[0]);
     }
     load_models();
+    // start config file monitoring thread if enabled
+    if (base_params.models_preset_watch && !base_params.models_preset.empty()) {
+        start_config_watch();
+    }
 }
 
 void server_models::add_model(server_model_meta && meta) {
@@ -149,6 +153,90 @@ void server_models::add_model(server_model_meta && meta) {
         /* th      */ std::thread(),
         /* meta    */ std::move(meta)
     };
+}
+
+void server_models::start_config_watch() {
+    if (base_params.models_preset.empty()) {
+        LOG_WRN("srv  start_config_watch: models_preset_watch enabled but models_preset is empty, config watch not started\n");
+        return;
+    }
+
+    LOG_INF("srv  start_config_watch: starting config file monitoring for %s (polling every %d seconds)\n", 
+            base_params.models_preset.c_str(), base_params.models_preset_watch_interval);
+    config_watch_running.store(true, std::memory_order_relaxed);
+
+    config_watch_thread = std::thread([this]() {
+        std::filesystem::path config_path(base_params.models_preset);
+        int64_t last_mtime = 0;
+
+        // initialize last_mtime from current file
+        try {
+            last_mtime = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::filesystem::last_write_time(config_path).time_since_epoch()
+            ).count();
+            config_last_modified.store(last_mtime, std::memory_order_relaxed);
+            LOG_INF("srv  config_watch: config file monitoring initialized: last_modified=%lld\n", (long long)last_mtime);
+        } catch (const std::exception & e) {
+            LOG_WRN("srv  config_watch: failed to get initial file modification time: %s\n", e.what());
+        }
+
+        // polling interval: configurable
+        const auto polling_interval = std::chrono::seconds(base_params.models_preset_watch_interval);
+
+        while (config_watch_running.load(std::memory_order_relaxed)) {
+            std::this_thread::sleep_for(polling_interval);
+
+            try {
+                // check if file still exists
+                if (!std::filesystem::exists(config_path)) {
+                    LOG_WRN("srv  config_watch: config file %s no longer exists, continuing to watch for it to reappear\n", base_params.models_preset.c_str());
+                    continue;
+                }
+
+                // get current modification time
+                int64_t current_mtime = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::filesystem::last_write_time(config_path).time_since_epoch()
+                ).count();
+
+                // check if file was modified
+                if (current_mtime > last_mtime) {
+                    LOG_INF("srv  config_watch: config file %s has been modified (old=%lld, new=%lld), initiating reload...\n",
+                            base_params.models_preset.c_str(), (long long)last_mtime, (long long)current_mtime);
+
+                    last_mtime = current_mtime;
+                    config_last_modified.store(current_mtime, std::memory_order_relaxed);
+
+                    // reload models configuration
+                    try {
+                        // reload models incrementally
+                        load_models_incremental();
+
+                        // update last loaded timestamp
+                        int64_t now = ggml_time_ms();
+                        config_last_loaded.store(now, std::memory_order_relaxed);
+
+                        LOG_INF("srv  config_watch: config reload completed successfully at timestamp %lld\n", (long long)now);
+                    } catch (const std::exception & e) {
+                        LOG_ERR("srv  config_watch: failed to reload config: %s\n", e.what());
+                        LOG_ERR("srv  config_watch: config file may contain errors, previous configuration remains active\n");
+                    }
+                }
+                
+                // check for idle models that need recycling
+                recycle_idle_models();
+                
+            } catch (const std::exception & e) {
+                LOG_ERR("srv  config_watch: error during config file monitoring: %s\n", e.what());
+            }
+        }
+
+        LOG_INF("srv  config_watch: config file monitoring thread stopped\n");
+    });
+}
+
+// helper function to compare if two presets have different configurations
+static bool preset_changed(const common_preset & old_preset, const common_preset & new_preset) {
+    return old_preset.to_ini() != new_preset.to_ini();
 }
 
 // TODO: allow refreshing cached model list
@@ -203,16 +291,25 @@ void server_models::load_models() {
     }
 
     // convert presets to server_model_meta and add to mapping
+    // check if this is a reload (mapping already has models)
+    bool is_reload = !mapping.empty();
+    if (is_reload) {
+        SRV_INF("reloading model configuration (clearing %zu existing models)\n", mapping.size());
+        mapping.clear();
+    }
+
     for (const auto & preset : final_presets) {
         server_model_meta meta{
-            /* preset       */ preset.second,
-            /* name         */ preset.first,
-            /* port         */ 0,
-            /* status       */ SERVER_MODEL_STATUS_UNLOADED,
-            /* last_used    */ 0,
-            /* args         */ std::vector<std::string>(),
-            /* exit_code    */ 0,
-            /* stop_timeout */ DEFAULT_STOP_TIMEOUT,
+            /* preset           */ preset.second,
+            /* name             */ preset.first,
+            /* port             */ 0,
+            /* status           */ SERVER_MODEL_STATUS_UNLOADED,
+            /* last_used        */ 0,
+            /* args             */ std::vector<std::string>(),
+            /* exit_code        */ 0,
+            /* stop_timeout     */ DEFAULT_STOP_TIMEOUT,
+            /* needs_recycle    */ false,
+            /* config_changed_at*/ 0,
         };
         add_model(std::move(meta));
     }
@@ -270,6 +367,205 @@ void server_models::load_models() {
     for (const auto & name : models_to_load) {
         SRV_INF("(startup) loading model %s\n", name.c_str());
         load(name);
+    }
+}
+
+void server_models::load_models_incremental() {
+    // load models from 3 sources:
+    // 1. cached models
+    common_presets cached_models = ctx_preset.load_from_cache();
+    SRV_INF("Loaded %zu cached model presets\n", cached_models.size());
+    // 2. local models from --models-dir
+    common_presets local_models;
+    if (!base_params.models_dir.empty()) {
+        local_models = ctx_preset.load_from_models_dir(base_params.models_dir);
+        SRV_INF("Loaded %zu local model presets from %s\n", local_models.size(), base_params.models_dir.c_str());
+    }
+    // 3. custom-path models from presets
+    common_preset global = {};
+    common_presets custom_presets = {};
+    if (!base_params.models_preset.empty()) {
+        custom_presets = ctx_preset.load_from_ini(base_params.models_preset, global);
+        SRV_INF("Loaded %zu custom model presets from %s\n", custom_presets.size(), base_params.models_preset.c_str());
+    }
+
+    // cascade, apply global preset first
+    cached_models  = ctx_preset.cascade(global, cached_models);
+    local_models   = ctx_preset.cascade(global, local_models);
+    custom_presets = ctx_preset.cascade(global, custom_presets);
+
+    // note: if a model exists in both cached and local, local takes precedence
+    common_presets final_presets;
+    for (const auto & [name, preset] : cached_models) {
+        final_presets[name] = preset;
+    }
+    for (const auto & [name, preset] : local_models) {
+        final_presets[name] = preset;
+    }
+
+    // process custom presets from INI
+    for (const auto & [name, custom] : custom_presets) {
+        if (final_presets.find(name) != final_presets.end()) {
+            // apply custom config if exists
+            common_preset & target = final_presets[name];
+            target.merge(custom);
+        } else {
+            // otherwise add directly
+            final_presets[name] = custom;
+        }
+    }
+
+    // server base preset from CLI args take highest precedence
+    for (auto & [name, preset] : final_presets) {
+        preset.merge(base_preset);
+    }
+
+    // now compare with existing models and update incrementally
+    std::unordered_set<std::string> models_in_new_config;
+    int64_t now = ggml_time_ms();
+    
+    {
+        std::lock_guard<std::mutex> lk(mutex);
+        
+        // first pass: update existing models and detect changes
+        for (auto & [name, inst] : mapping) {
+            auto it = final_presets.find(name);
+            if (it != final_presets.end()) {
+                // model exists in both old and new config
+                models_in_new_config.insert(name);
+                
+                // check if config changed
+                if (preset_changed(inst.meta.preset, it->second)) {
+                    // config changed - mark for recycling
+                    inst.meta.needs_recycle = true;
+                    inst.meta.config_changed_at = now;
+                    inst.meta.preset = it->second;  // update preset with new config
+                    inst.meta.update_args(ctx_preset, bin_path);  // render new args
+                    
+                    LOG_INF("srv  load_models_incremental: model '%s' config changed, marked for recycling\n", name.c_str());
+                } else {
+                    // config unchanged - no action needed
+                    LOG_INF("srv  load_models_incremental: model '%s' config unchanged\n", name.c_str());
+                }
+            } else {
+                // model removed from config - will be unloaded by recycling or explicit API call
+                LOG_WRN("srv  load_models_incremental: model '%s' removed from config\n", name.c_str());
+            }
+        }
+        
+        // second pass: add new models
+        for (const auto & [name, preset] : final_presets) {
+            if (models_in_new_config.find(name) == models_in_new_config.end()) {
+                // new model - add to mapping
+                server_model_meta meta{
+                    /* preset           */ preset,
+                    /* name             */ name,
+                    /* port             */ 0,
+                    /* status           */ SERVER_MODEL_STATUS_UNLOADED,
+                    /* last_used        */ 0,
+                    /* args             */ std::vector<std::string>(),
+                    /* exit_code        */ 0,
+                    /* stop_timeout     */ DEFAULT_STOP_TIMEOUT,
+                    /* needs_recycle    */ false,
+                    /* config_changed_at*/ 0,
+                };
+                add_model(std::move(meta));
+                LOG_INF("srv  load_models_incremental: new model '%s' added\n", name.c_str());
+            }
+        }
+    }
+    
+    // log available models
+    {
+        std::unordered_set<std::string> custom_names;
+        for (const auto & [name, preset] : custom_presets) {
+            custom_names.insert(name);
+        }
+        SRV_INF("Available models (%zu) (*: custom preset, [recycle]: pending recycling)\n", mapping.size());
+        for (const auto & [name, inst] : mapping) {
+            bool has_custom = custom_names.find(name) != custom_names.end();
+            std::string status_marker = inst.meta.needs_recycle ? " [recycle]" : "";
+            SRV_INF("  %c %s%s\n", has_custom ? '*' : ' ', name.c_str(), status_marker.c_str());
+        }
+    }
+    
+    // handle custom stop-timeout option
+    for (auto & [name, inst] : mapping) {
+        std::string val;
+        if (inst.meta.preset.get_option(COMMON_ARG_PRESET_STOP_TIMEOUT, val)) {
+            try {
+                inst.meta.stop_timeout = std::stoi(val);
+            } catch (...) {
+                SRV_WRN("invalid stop-timeout value '%s' for model '%s', using default %d seconds\n",
+                    val.c_str(), name.c_str(), DEFAULT_STOP_TIMEOUT);
+                inst.meta.stop_timeout = DEFAULT_STOP_TIMEOUT;
+            }
+        }
+    }
+    
+    // handle custom pin option
+    for (auto & [name, inst] : mapping) {
+        std::string val;
+        if (inst.meta.preset.get_option(COMMON_ARG_PRESET_PIN, val)) {
+            inst.meta.pinned = true;
+        }
+    }
+}
+
+void server_models::recycle_idle_models() {
+    int64_t now = ggml_time_ms();
+    int64_t idle_threshold_ms = base_params.models_recycle_idle_seconds * 1000;
+    
+    std::vector<std::string> models_to_unload;
+    
+    {
+        std::lock_guard<std::mutex> lk(mutex);
+        for (auto & [name, inst] : mapping) {
+            // check if model needs recycling
+            if (inst.meta.needs_recycle && 
+                inst.meta.status == SERVER_MODEL_STATUS_LOADED &&
+                !inst.meta.pinned) {  // skip pinned models
+                
+                // check if model has been idle long enough
+                int64_t idle_time = now - inst.meta.last_used;
+                int64_t time_since_change = now - inst.meta.config_changed_at;
+                
+                // wait at least the configured idle time AND at least one polling interval
+                if (idle_time >= idle_threshold_ms && 
+                    time_since_change >= idle_threshold_ms) {
+                    models_to_unload.push_back(name);
+                    LOG_INF("srv  recycle_idle: unloading model '%s' after %.1f seconds idle (config changed %.1f seconds ago)\n",
+                            name.c_str(), 
+                            idle_time / 1000.0,
+                            time_since_change / 1000.0);
+                }
+            }
+        }
+    }
+    
+    // unload models outside the lock
+    for (const auto & name : models_to_unload) {
+        unload(name);
+        
+        // wait for unload to complete
+        {
+            std::unique_lock<std::mutex> lk(mutex);
+            cv.wait(lk, [this, &name]() {
+                auto it = mapping.find(name);
+                return it != mapping.end() && 
+                       it->second.meta.status == SERVER_MODEL_STATUS_UNLOADED;
+            });
+        }
+        
+        // clear recycling flags
+        {
+            std::lock_guard<std::mutex> lk(mutex);
+            auto it = mapping.find(name);
+            if (it != mapping.end()) {
+                it->second.meta.needs_recycle = false;
+                it->second.meta.config_changed_at = 0;
+            }
+        }
     }
 }
 
@@ -411,7 +707,7 @@ void server_models::unload_lru() {
             });
         }
     } else if (count_active >= (size_t)base_params.models_max) {
-        SRV_WRN("models_max limit reached, but no unpinned models available for LRU eviction - automatic unload cannot succeed\n");
+        LOG_WRN("srv  unload_lru: models_max limit reached, but no unpinned models available for LRU eviction - automatic unload cannot succeed\n");
     }
 }
 
@@ -866,6 +1162,21 @@ void server_models_routes::init_routes() {
         }
         metrics_output << "llama_router_models_loaded " << loaded_count << '\n';
 
+        // Add recycling metrics
+        size_t recycle_pending_count = 0;
+        for (const auto & meta : all_models) {
+            if (meta.needs_recycle) {
+                recycle_pending_count++;
+            }
+        }
+        metrics_output << "llama_router_models_pending_recycle " << recycle_pending_count << '\n';
+
+        // Add config reload metrics
+        int64_t config_last_modified = models.get_config_last_modified();
+        int64_t config_last_loaded = models.get_config_last_loaded();
+        metrics_output << "llama_router_config_last_modified " << config_last_modified << '\n';
+        metrics_output << "llama_router_config_last_loaded " << config_last_loaded << '\n';
+
         res->status = 200;
         res->data = metrics_output.str();
         return res;
@@ -933,6 +1244,9 @@ void server_models_routes::init_routes() {
             if (meta.is_failed()) {
                 status["exit_code"] = meta.exit_code;
                 status["failed"]    = true;
+            }
+            if (meta.needs_recycle) {
+                status["recycle_pending"] = true;
             }
             models_json.push_back(json {
                 {"id",       meta.name},

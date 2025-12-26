@@ -59,6 +59,8 @@ struct server_model_meta {
     int exit_code = 0; // exit code of the model instance process (only valid if status == FAILED)
     int stop_timeout = 0; // seconds to wait before force-killing the model instance during shutdown
     bool pinned = false; // if true, this model will not be unloaded by LRU
+    bool needs_recycle = false; // marked for recycling due to config change
+    int64_t config_changed_at = 0; // timestamp when config change was detected (milliseconds)
 
     bool is_active() const {
         return status == SERVER_MODEL_STATUS_LOADED || status == SERVER_MODEL_STATUS_LOADING;
@@ -97,10 +99,22 @@ private:
     std::vector<std::string> base_env;
     common_preset base_preset; // base preset from llama-server CLI args
 
+    // config file monitoring
+    std::thread config_watch_thread;
+    std::atomic<bool> config_watch_running{false};
+    std::atomic<int64_t> config_last_modified{0};
+    std::atomic<int64_t> config_last_loaded{0};
+
     void update_meta(const std::string & name, const server_model_meta & meta);
 
     // unload least recently used models if the limit is reached
     void unload_lru();
+
+    // check for idle models marked for recycling and unload them
+    void recycle_idle_models();
+
+    // load models with incremental update (preserves loaded instances)
+    void load_models_incremental();
 
     // not thread-safe, caller must hold mutex
     void add_model(server_model_meta && meta);
@@ -109,6 +123,9 @@ public:
     server_models(const common_params & params, int argc, char ** argv, char ** envp);
 
     void load_models();
+
+    // start config file monitoring thread (if models_preset_watch is enabled)
+    void start_config_watch();
 
     // check if a model instance exists (thread-safe)
     bool has_model(const std::string & name);
@@ -142,6 +159,16 @@ public:
     // notify the router server that a model instance is ready
     // return the monitoring thread (to be joined by the caller)
     static std::thread setup_child_server(const std::function<void(int)> & shutdown_handler);
+
+    // get the last time the config file was loaded (unix timestamp)
+    int64_t get_config_last_loaded() const {
+        return config_last_loaded.load();
+    }
+
+    // get the last time the config file was modified (unix timestamp)
+    int64_t get_config_last_modified() const {
+        return config_last_modified.load();
+    }
 };
 
 struct server_models_routes {
