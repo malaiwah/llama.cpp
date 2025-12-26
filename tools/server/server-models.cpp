@@ -142,6 +142,28 @@ server_models::server_models(
     }
 }
 
+server_models::~server_models() {
+    // stop config file monitoring thread
+    if (config_watch_running.load(std::memory_order_relaxed)) {
+        LOG_INF("srv  ~server_models: stopping config file monitoring thread\n");
+        config_watch_running.store(false, std::memory_order_relaxed);
+        if (config_watch_thread.joinable()) {
+            config_watch_thread.join();
+        }
+    }
+    // cleanup will be handled by unload_all() if needed
+}
+
+void server_models::stop_config_watch() {
+    if (config_watch_running.load(std::memory_order_relaxed)) {
+        LOG_INF("srv  stop_config_watch: stopping config file monitoring thread\n");
+        config_watch_running.store(false, std::memory_order_relaxed);
+        if (config_watch_thread.joinable()) {
+            config_watch_thread.join();
+        }
+    }
+}
+
 void server_models::add_model(server_model_meta && meta) {
     if (mapping.find(meta.name) != mapping.end()) {
         throw std::runtime_error(string_format("model '%s' appears multiple times", meta.name.c_str()));
@@ -547,14 +569,18 @@ void server_models::recycle_idle_models() {
     for (const auto & name : models_to_unload) {
         unload(name);
         
-        // wait for unload to complete
+        // wait for unload to complete with timeout
         {
             std::unique_lock<std::mutex> lk(mutex);
-            cv.wait(lk, [this, &name]() {
+            auto timeout = std::chrono::seconds(30);
+            bool completed = cv.wait_for(lk, timeout, [this, &name]() {
                 auto it = mapping.find(name);
-                return it != mapping.end() && 
+                return it != mapping.end() &&
                        it->second.meta.status == SERVER_MODEL_STATUS_UNLOADED;
             });
+            if (!completed) {
+                LOG_WRN("srv  recycle_idle: timeout waiting for model '%s' to unload, proceeding anyway\n", name.c_str());
+            }
         }
         
         // clear recycling flags

@@ -121,11 +121,17 @@ private:
 
 public:
     server_models(const common_params & params, int argc, char ** argv, char ** envp);
+    ~server_models();
 
     void load_models();
 
     // start config file monitoring thread (if models_preset_watch is enabled)
+    // thread-safe: can be called during construction
     void start_config_watch();
+
+    // stop config file monitoring thread gracefully
+    // thread-safe: can be called from any thread
+    void stop_config_watch();
 
     // check if a model instance exists (thread-safe)
     bool has_model(const std::string & name);
