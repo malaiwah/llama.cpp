@@ -567,8 +567,18 @@ void server_models::recycle_idle_models() {
     
     // unload models outside the lock
     for (const auto & name : models_to_unload) {
+        // clear recycling flags before unload to avoid race with config reload
+        {
+            std::lock_guard<std::mutex> lk(mutex);
+            auto it = mapping.find(name);
+            if (it != mapping.end()) {
+                it->second.meta.needs_recycle = false;
+                it->second.meta.config_changed_at = 0;
+            }
+        }
+
         unload(name);
-        
+
         // wait for unload to complete with timeout
         {
             std::unique_lock<std::mutex> lk(mutex);
@@ -580,16 +590,6 @@ void server_models::recycle_idle_models() {
             });
             if (!completed) {
                 LOG_WRN("srv  recycle_idle: timeout waiting for model '%s' to unload, proceeding anyway\n", name.c_str());
-            }
-        }
-        
-        // clear recycling flags
-        {
-            std::lock_guard<std::mutex> lk(mutex);
-            auto it = mapping.find(name);
-            if (it != mapping.end()) {
-                it->second.meta.needs_recycle = false;
-                it->second.meta.config_changed_at = 0;
             }
         }
     }
@@ -749,6 +749,14 @@ void server_models::load(const std::string & name) {
     if (meta.status != SERVER_MODEL_STATUS_UNLOADED) {
         SRV_INF("model %s is not ready\n", name.c_str());
         return;
+    }
+
+    // check if model is marked for recycling due to config change
+    // if so, use the updated config instead of the stale one
+    if (meta.needs_recycle) {
+        SRV_INF("model %s config has changed, using updated config\n", name.c_str());
+        // meta.preset already contains the updated config from load_models_incremental
+        // meta.args already contains the rendered args from load_models_incremental
     }
 
     // prepare new instance info
@@ -977,16 +985,20 @@ bool server_models::ensure_model_loaded(const std::string & name) {
 }
 
 server_http_res_ptr server_models::proxy_request(const server_http_req & req, const std::string & method, const std::string & name, bool update_last_used) {
-    auto meta = get_meta(name);
-    if (!meta.has_value()) {
-        throw std::runtime_error("model name=" + name + " is not found");
-    }
-    if (meta->status != SERVER_MODEL_STATUS_LOADED) {
-        throw std::invalid_argument("model name=" + name + " is not loaded");
-    }
-    if (update_last_used) {
-        std::unique_lock<std::mutex> lk(mutex);
-        mapping[name].meta.last_used = ggml_time_ms();
+    std::optional<server_model_meta> meta;
+    {
+        std::lock_guard<std::mutex> lk(mutex);
+        auto it = mapping.find(name);
+        if (it == mapping.end()) {
+            throw std::runtime_error("model name=" + name + " is not found");
+        }
+        if (it->second.meta.status != SERVER_MODEL_STATUS_LOADED) {
+            throw std::invalid_argument("model name=" + name + " is not loaded");
+        }
+        meta = it->second.meta;
+        if (update_last_used) {
+            it->second.meta.last_used = ggml_time_ms();
+        }
     }
     SRV_INF("proxying request to model %s on port %d\n", name.c_str(), meta->port);
     auto proxy = std::make_unique<server_http_proxy>(
