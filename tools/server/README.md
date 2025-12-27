@@ -204,6 +204,9 @@ For the ful list of features, please refer to [server's changelog](https://githu
 | `--models-preset PATH` | path to INI file containing model presets for the router server (default: disabled)<br/>(env: LLAMA_ARG_MODELS_PRESET) |
 | `--models-max N` | for router server, maximum number of models to load simultaneously (default: 4, 0 = unlimited)<br/>(env: LLAMA_ARG_MODELS_MAX) |
 | `--models-autoload, --no-models-autoload` | for router server, whether to automatically load models (default: enabled)<br/>(env: LLAMA_ARG_MODELS_AUTOLOAD) |
+| `--kv-cache-persist-path PATH` | for router server, directory to save KV cache when models are unloaded (default: disabled)<br/>(env: LLAMA_ARG_KV_CACHE_PERSIST_PATH) |
+| `--no-kv-cache-on-unload` | for router server, do not save KV cache when model is unloaded (default: save enabled)<br/>(env: LLAMA_ARG_KV_CACHE_ON_UNLOAD) |
+| `--no-kv-cache-on-load` | for router server, do not restore KV cache when model is loaded (default: restore enabled)<br/>(env: LLAMA_ARG_KV_CACHE_ON_LOAD) |
 | `--jinja, --no-jinja` | whether to use jinja template engine for chat (default: enabled)<br/>(env: LLAMA_ARG_JINJA) |
 | `--reasoning-format FORMAT` | controls whether thought tags are allowed and/or extracted from the response, and in which format they're returned; one of:<br/>- none: leaves thoughts unparsed in `message.content`<br/>- deepseek: puts thoughts in `message.reasoning_content`<br/>- deepseek-legacy: keeps `<think>` tags in `message.content` while also populating `message.reasoning_content`<br/>(default: auto)<br/>(env: LLAMA_ARG_THINK) |
 | `--reasoning-budget N` | controls the amount of thinking allowed; currently only one of: -1 for unrestricted thinking budget, or 0 to disable thinking (default: -1)<br/>(env: LLAMA_ARG_THINK_BUDGET) |
@@ -1487,6 +1490,9 @@ The precedence rule for preset options is as follows:
 We also offer additional options that are exclusive to presets (these aren't treated as command-line arguments):
 - `load-on-startup` (boolean): Controls whether the model loads automatically when the server starts
 - `stop-timeout` (int, seconds): After requested unload, wait for this many seconds before forcing termination (default: 10)
+- `kv-cache-persist-path` (string): Directory to save KV cache when this model is unloaded. When the model is later reloaded, the KV cache will be restored. (default: empty, disabled)
+- `no-kv-cache-on-unload` (boolean): Disable saving KV cache when this model is unloaded (default: save enabled)
+- `no-kv-cache-on-load` (boolean): Disable restoring KV cache when this model is loaded (default: restore enabled)
 
 ### Routing requests
 
@@ -1596,7 +1602,7 @@ Payload:
 
 ```json
 {
-  "model": "ggml-org/gemma-3-4b-it-GGUF:Q4_K_M",
+  "model": "ggml-org/gemma-3-4b-it-GGUF:Q4_K_M"
 }
 ```
 
@@ -1607,6 +1613,120 @@ Response:
   "success": true
 }
 ```
+
+## KV Cache Persistence
+
+When running in router mode, you can configure models to save their KV cache (prompt cache) to disk when unloaded and automatically reload it when the model is loaded again. This preserves the computational benefits of cached prompts across model reloads, significantly improving performance when models are frequently evicted due to `models_max` limits.
+
+### Overview
+
+The KV cache persistence feature allows the server to:
+- Save all slot KV caches to disk when a model is unloaded
+- Automatically restore saved KV caches when the model is reloaded
+- Avoid reprocessing common prompt prefixes across model reloads
+- Maintain cache hits even when models are evicted and reloaded
+
+This is particularly useful in scenarios where:
+- Multiple models compete for limited memory (controlled by `--models-max`)
+- Models are frequently loaded and unloaded
+- Applications send similar prompts repeatedly
+
+### Configuration
+
+#### Command-line arguments
+
+The following command-line arguments control KV cache persistence globally for the router:
+
+- `--kv-cache-persist-path PATH`: Directory to save KV cache when models are unloaded (default: disabled)
+- `--no-kv-cache-on-unload`: Do not save KV cache when model is unloaded (default: save enabled)
+- `--no-kv-cache-on-load`: Do not restore KV cache when model is loaded (default: restore enabled)
+
+Example:
+
+```sh
+llama-server --models-preset ./models.ini --kv-cache-persist-path /var/cache/llama/kv_cache
+```
+
+#### Model preset configuration
+
+You can also configure KV cache persistence per-model in your preset file:
+
+```ini
+version = 1
+
+[my-model]
+model = Qwen/Qwen2.5-7B-Instruct-GGUF:Q4_K_M
+kv-cache-persist-path = /var/cache/llama/my-model
+no-kv-cache-on-unload = false
+no-kv-cache-on-load = false
+```
+
+Preset-specific options:
+- `kv-cache-persist-path` (string): Directory to save KV cache when this model is unloaded (default: empty, disabled)
+- `no-kv-cache-on-unload` (boolean): Disable saving KV cache when this model is unloaded (default: save enabled)
+- `no-kv-cache-on-load` (boolean): Disable restoring KV cache when this model is loaded (default: restore enabled)
+
+### Behavior
+
+- **Save**: When a model is unloaded, all slot KV caches are saved to the specified directory
+- **Load**: When a model is loaded, saved KV caches are automatically restored to matching slots
+- **Invalid Files**: If saved files are invalid or corrupted, they are skipped and overwritten on next save
+- **Empty Cache**: If no slots have cached prompts, no files are created
+- **Slot Matching**: KV caches are restored to slots with matching IDs (slot_0.bin → slot 0, etc.)
+- **Directory Creation**: The persist directory is created automatically if it doesn't exist
+
+### File Format
+
+KV cache files are saved in llama.cpp's state format:
+- `{persist_path}/slot_0.bin`, `{persist_path}/slot_1.bin`, etc. - One file per slot
+- Each file contains the complete KV cache state for a single slot
+- Files are binary and include both token data and KV tensor data
+- File names are deterministic based on slot IDs
+
+### Usage Example
+
+```bash
+# Start router server with KV cache persistence
+./llama-server --models-preset models.ini --kv-cache-persist-path /tmp/kv_cache
+
+# Load model (will restore saved cache if exists)
+curl -X POST http://localhost:8080/models/load \
+  -H "Content-Type: application/json" \
+  -d '{"model": "my-model"}'
+
+# Process request (will use cached prompts if available)
+curl -X POST http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "my-model",
+    "messages": [{"role": "user", "content": "Hello, how are you?"}]
+  }'
+
+# Unload model (will save cache)
+curl -X POST http://localhost:8080/models/unload \
+  -H "Content-Type: application/json" \
+  -d '{"model": "my-model"}'
+
+# Reload model (will restore saved cache)
+curl -X POST http://localhost:8080/models/load \
+  -H "Content-Type: application/json" \
+  -d '{"model": "my-model"}'
+
+# Process similar request (should benefit from cache hit)
+curl -X POST http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "my-model",
+    "messages": [{"role": "user", "content": "Hello, how are you today?"}]
+  }'
+```
+
+### Performance Considerations
+
+- **Disk I/O**: Saving and loading KV caches involves disk I/O, which adds overhead to load/unload operations
+- **Cache Size**: Each saved slot's KV cache can be large (depends on context size and model architecture)
+- **Disk Space**: Ensure sufficient disk space is available for cached KV data
+- **SSD Recommended**: For best performance, use SSD storage for the persist directory
 
 ## API errors
 
