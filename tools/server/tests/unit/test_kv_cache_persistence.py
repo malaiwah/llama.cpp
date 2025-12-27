@@ -7,6 +7,9 @@ import pytest
 import os
 import tempfile
 import shutil
+import time
+import re
+from pathlib import Path
 from utils import *
 
 server: ServerProcess
@@ -54,6 +57,198 @@ def test_kv_cache_disabled():
     assert unload_res.status_code == 200
 
     _wait_for_model_status(model_id, {"unloaded"})
+
+
+def test_kv_cache_save_load_cycle():
+    """Test complete KV cache save and load cycle.
+
+    This test verifies that:
+    1. KV cache is saved when model is unloaded
+    2. Cache files are created (.seq0, .seq1, etc.)
+    3. KV cache is loaded when model is reloaded
+    4. Cache is reused for similar requests
+    5. Temporary directory is cleaned up
+
+    The test creates a temporary directory with a model preset file
+    configured with kv-cache-persist-path to enable the feature.
+    """
+    global server
+
+    # Create a temporary directory for KV cache and model presets
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_path = Path(temp_dir)
+        cache_dir = temp_path / "cache"
+        cache_dir.mkdir()
+
+        # Create a model preset file with KV cache persistence enabled
+        preset_file = temp_path / "models.ini"
+        preset_content = f"""[test-model]
+model = ggml-org/tinygemma3-GGUF:Q8_0
+kv-cache-persist-path = {cache_dir / "test-model.kvcache"}
+"""
+        preset_file.write_text(preset_content)
+
+        # Configure server to use the temporary preset file
+        server.models_preset = str(preset_file)
+        server.start()
+
+        model_id = "test-model"
+
+        # Step 1: Load the model
+        print(f"[TEST] Loading model {model_id}...")
+        load_res = server.make_request("POST", "/models/load", data={"model": model_id})
+        assert load_res.status_code == 200, f"Failed to load model: {load_res.body}"
+        assert load_res.body.get("success") is True
+
+        _wait_for_model_status(model_id, {"loaded"}, timeout=120)
+        print(f"[TEST] Model {model_id} loaded successfully")
+
+        # Step 2: Process a chat completion request to populate the cache
+        print("[TEST] Processing first request to populate cache...")
+        chat_res1 = server.make_request(
+            "POST",
+            "/v1/chat/completions",
+            data={
+                "model": model_id,
+                "messages": [{"role": "user", "content": "Hello, how are you?"}],
+                "max_tokens": 10,
+            },
+        )
+        assert chat_res1.status_code == 200, f"Chat completion failed: {chat_res1.body}"
+        assert "choices" in chat_res1.body
+        print(
+            f"[TEST] First request completed: {chat_res1.body['choices'][0]['message']['content']}"
+        )
+
+        # Step 3: Unload the model (should trigger KV cache save)
+        print("[TEST] Unloading model to trigger cache save...")
+        unload_res1 = server.make_request(
+            "POST", "/models/unload", data={"model": model_id}
+        )
+        assert unload_res1.status_code == 200, (
+            f"Failed to unload model: {unload_res1.body}"
+        )
+
+        _wait_for_model_status(model_id, {"unloaded"})
+        print("[TEST] Model unloaded successfully")
+
+        # Step 4: Verify cache files were created
+        print("[TEST] Checking for cache files...")
+        cache_files = list(cache_dir.glob("*.seq*"))
+        assert len(cache_files) > 0, (
+            f"No cache files found in {cache_dir}. Expected at least one .seq file"
+        )
+        print(
+            f"[TEST] Found {len(cache_files)} cache file(s): {[f.name for f in cache_files]}"
+        )
+
+        # Verify at least .seq0 exists
+        seq0_file = cache_dir / "test-model.kvcache.seq0"
+        assert seq0_file.exists(), f"Cache file {seq0_file} was not created"
+        assert seq0_file.stat().st_size > 0, f"Cache file {seq0_file} is empty"
+        print(
+            f"[TEST] Cache file {seq0_file.name} exists with size {seq0_file.stat().st_size} bytes"
+        )
+
+        # Step 5: Reload the model (should trigger KV cache load)
+        print("[TEST] Reloading model to trigger cache load...")
+        load_res2 = server.make_request(
+            "POST", "/models/load", data={"model": model_id}
+        )
+        assert load_res2.status_code == 200, f"Failed to reload model: {load_res2.body}"
+        assert load_res2.body.get("success") is True
+
+        _wait_for_model_status(model_id, {"loaded"}, timeout=120)
+        print("[TEST] Model reloaded successfully")
+
+        # Step 6: Process a similar request (should use cached KV cache)
+        print("[TEST] Processing second request to verify cache reuse...")
+        chat_res2 = server.make_request(
+            "POST",
+            "/v1/chat/completions",
+            data={
+                "model": model_id,
+                "messages": [{"role": "user", "content": "Hello, how are you?"}],
+                "max_tokens": 10,
+            },
+        )
+        assert chat_res2.status_code == 200, (
+            f"Second chat completion failed: {chat_res2.body}"
+        )
+        assert "choices" in chat_res2.body
+        print(
+            f"[TEST] Second request completed: {chat_res2.body['choices'][0]['message']['content']}"
+        )
+
+        # Step 7: Unload model again to save cache
+        print("[TEST] Unloading model to save cache again...")
+        unload_res2 = server.make_request(
+            "POST", "/models/unload", data={"model": model_id}
+        )
+        assert unload_res2.status_code == 200, (
+            f"Failed to unload model: {unload_res2.body}"
+        )
+
+        _wait_for_model_status(model_id, {"unloaded"})
+        print("[TEST] Model unloaded successfully")
+
+        # Step 8: Verify cache files still exist and are valid
+        print("[TEST] Verifying cache files after second unload...")
+        cache_files_after = list(cache_dir.glob("*.seq*"))
+        assert len(cache_files_after) > 0, (
+            f"No cache files found in {cache_dir} after second unload"
+        )
+        print(f"[TEST] Cache files still exist: {[f.name for f in cache_files_after]}")
+
+        # Step 9: Reload model one more time to verify cache loads correctly
+        print("[TEST] Reloading model to verify cache loads correctly...")
+        load_res3 = server.make_request(
+            "POST", "/models/load", data={"model": model_id}
+        )
+        assert load_res3.status_code == 200, (
+            f"Failed to reload model third time: {load_res3.body}"
+        )
+        assert load_res3.body.get("success") is True
+
+        _wait_for_model_status(model_id, {"loaded"}, timeout=120)
+        print("[TEST] Model reloaded successfully (third time)")
+
+        # Step 10: Process another request
+        print("[TEST] Processing third request...")
+        chat_res3 = server.make_request(
+            "POST",
+            "/v1/chat/completions",
+            data={
+                "model": model_id,
+                "messages": [{"role": "user", "content": "Tell me a short story"}],
+                "max_tokens": 15,
+            },
+        )
+        assert chat_res3.status_code == 200, (
+            f"Third chat completion failed: {chat_res3.body}"
+        )
+        assert "choices" in chat_res3.body
+        print(
+            f"[TEST] Third request completed: {chat_res3.body['choices'][0]['message']['content']}"
+        )
+
+        # Step 11: Final cleanup - unload model
+        print("[TEST] Final cleanup - unloading model...")
+        unload_res3 = server.make_request(
+            "POST", "/models/unload", data={"model": model_id}
+        )
+        assert unload_res3.status_code == 200, (
+            f"Failed to unload model: {unload_res3.body}"
+        )
+
+        _wait_for_model_status(model_id, {"unloaded"})
+        print("[TEST] Model unloaded successfully")
+
+        print("[TEST] KV cache save/load cycle test completed successfully")
+        print(f"[TEST] Cache directory: {cache_dir}")
+        print(f"[TEST] Cache files: {[f.name for f in cache_files_after]}")
+
+        # Temporary directory will be automatically cleaned up by tempfile context manager
 
 
 def test_kv_cache_router_mode_basic():

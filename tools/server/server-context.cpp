@@ -821,12 +821,14 @@ struct server_context_impl {
                     }
 
                     std::vector<llama_token> tokens;
-                    size_t                   n_tokens = 0;
+                    tokens.resize(n_ctx);
+                    size_t n_tokens = 0;
 
-                    size_t read = llama_state_seq_load_file(ctx, seq_path.c_str(), seq_id, tokens.data(),
-                                                            tokens.capacity(), &n_tokens);
+                    size_t read = llama_state_seq_load_file(ctx, seq_path.c_str(), seq_id, tokens.data(), tokens.size(),
+                                                            &n_tokens);
 
-                    if (read > 0) {
+                    if (read > 0 && n_tokens > 0) {
+                        tokens.resize(n_tokens);
                         loaded_count++;
                         SRV_INF("%s: loaded sequence %d: %zu tokens, %zu bytes from %s\n", __func__, seq_id, n_tokens,
                                 read, seq_path.c_str());
