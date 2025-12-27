@@ -3006,8 +3006,11 @@ bool server_context::load_kv_cache(const std::string & path) {
         return false;
     }
 
-    int loaded_count = 0;
-    int seq_id       = 0;
+    int       loaded_count = 0;
+    int       seq_id       = 0;
+    const int n_ctx        = llama_n_ctx(ctx);
+
+    const auto t_start = ggml_time_ms();
 
     while (true) {
         std::string seq_path = path + ".seq" + std::to_string(seq_id);
@@ -3017,13 +3020,22 @@ bool server_context::load_kv_cache(const std::string & path) {
             break;
         }
 
+        std::error_code ec;
+        auto            file_size = std::filesystem::file_size(seq_path, ec);
+        if (ec || file_size == 0) {
+            SRV_WRN("%s: skipping empty or invalid sequence file %s\n", __func__, seq_path.c_str());
+            seq_id++;
+            continue;
+        }
+
         std::vector<llama_token> tokens;
-        size_t                   n_tokens = 0;
+        tokens.resize(n_ctx);
+        size_t n_tokens = 0;
 
-        size_t read =
-            llama_state_seq_load_file(ctx, seq_path.c_str(), seq_id, tokens.data(), tokens.capacity(), &n_tokens);
+        size_t read = llama_state_seq_load_file(ctx, seq_path.c_str(), seq_id, tokens.data(), tokens.size(), &n_tokens);
 
-        if (read > 0) {
+        if (read > 0 && n_tokens > 0) {
+            tokens.resize(n_tokens);
             loaded_count++;
             SRV_INF("%s: loaded sequence %d: %zu tokens, %zu bytes from %s\n", __func__, seq_id, n_tokens, read,
                     seq_path.c_str());
@@ -3040,7 +3052,9 @@ bool server_context::load_kv_cache(const std::string & path) {
         seq_id++;
     }
 
-    SRV_INF("%s: loaded %d sequences into prompt cache\n", __func__, loaded_count);
+    const auto t_end = ggml_time_ms();
+    SRV_INF("%s: loaded %d sequences into prompt cache in %.2f ms\n", __func__, loaded_count,
+            (double) (t_end - t_start));
     return loaded_count > 0;
 }
 
