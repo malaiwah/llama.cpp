@@ -5,10 +5,10 @@
 #include "server-common.h"
 #include "server-http.h"
 
-#include <mutex>
 #include <condition_variable>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <set>
 
 /**
@@ -42,33 +42,36 @@ static server_model_status server_model_status_from_string(const std::string & s
 
 static std::string server_model_status_to_string(server_model_status status) {
     switch (status) {
-        case SERVER_MODEL_STATUS_UNLOADED: return "unloaded";
-        case SERVER_MODEL_STATUS_LOADING:  return "loading";
-        case SERVER_MODEL_STATUS_LOADED:   return "loaded";
-        default:                           return "unknown";
+        case SERVER_MODEL_STATUS_UNLOADED:
+            return "unloaded";
+        case SERVER_MODEL_STATUS_LOADING:
+            return "loading";
+        case SERVER_MODEL_STATUS_LOADED:
+            return "loaded";
+        default:
+            return "unknown";
     }
 }
 
 struct server_model_meta {
-    common_preset preset;
-    std::string name;
-    int port = 0;
-    server_model_status status = SERVER_MODEL_STATUS_UNLOADED;
-    int64_t last_used = 0; // for LRU unloading
-    std::vector<std::string> args; // args passed to the model instance, will be populated by render_args()
-    int exit_code = 0; // exit code of the model instance process (only valid if status == FAILED)
-    int stop_timeout = 0; // seconds to wait before force-killing the model instance during shutdown
-    bool pinned = false; // if true, this model will not be unloaded by LRU
-    bool needs_recycle = false; // marked for recycling due to config change
-    int64_t config_changed_at = 0; // timestamp when config change was detected (milliseconds)
+    common_preset            preset;
+    std::string              name;
+    int                      port      = 0;
+    server_model_status      status    = SERVER_MODEL_STATUS_UNLOADED;
+    int64_t                  last_used = 0;  // for LRU unloading
+    std::vector<std::string> args;           // args passed to the model instance, will be populated by render_args()
+    int                      exit_code = 0;  // exit code of the model instance process (only valid if status == FAILED)
+    int         stop_timeout           = 0;  // seconds to wait before force-killing the model instance during shutdown
+    bool        pinned                 = false;  // if true, this model will not be unloaded by LRU
+    bool        needs_recycle          = false;  // marked for recycling due to config change
+    int64_t     config_changed_at      = 0;      // timestamp when config change was detected (milliseconds)
+    std::string kv_cache_persist_path;           // directory for KV cache persistence (from preset or CLI)
+    bool        kv_cache_on_unload = true;       // save KV cache on unload
+    bool        kv_cache_on_load   = true;       // restore KV cache on load
 
-    bool is_active() const {
-        return status == SERVER_MODEL_STATUS_LOADED || status == SERVER_MODEL_STATUS_LOADING;
-    }
+    bool is_active() const { return status == SERVER_MODEL_STATUS_LOADED || status == SERVER_MODEL_STATUS_LOADING; }
 
-    bool is_failed() const {
-        return status == SERVER_MODEL_STATUS_UNLOADED && exit_code != 0;
-    }
+    bool is_failed() const { return status == SERVER_MODEL_STATUS_UNLOADED && exit_code != 0; }
 
     void update_args(common_preset_context & ctx_presets, std::string bin_path);
 };
@@ -76,34 +79,34 @@ struct server_model_meta {
 struct subprocess_s;
 
 struct server_models {
-private:
+  private:
     struct instance_t {
-        std::shared_ptr<subprocess_s> subproc; // shared between main thread and monitoring thread
-        std::thread th;
-        server_model_meta meta;
-        FILE * stdin_file = nullptr;
+        std::shared_ptr<subprocess_s> subproc;  // shared between main thread and monitoring thread
+        std::thread                   th;
+        server_model_meta             meta;
+        FILE *                        stdin_file = nullptr;
     };
 
-    std::mutex mutex;
-    std::condition_variable cv;
+    std::mutex                        mutex;
+    std::condition_variable           cv;
     std::map<std::string, instance_t> mapping;
 
     // for stopping models
     std::condition_variable cv_stop;
-    std::set<std::string> stopping_models;
+    std::set<std::string>   stopping_models;
 
     common_preset_context ctx_preset;
 
-    common_params base_params;
-    std::string bin_path;
+    common_params            base_params;
+    std::string              bin_path;
     std::vector<std::string> base_env;
-    common_preset base_preset; // base preset from llama-server CLI args
+    common_preset            base_preset;  // base preset from llama-server CLI args
 
     // config file monitoring
-    std::thread config_watch_thread;
-    std::atomic<bool> config_watch_running{false};
-    std::atomic<int64_t> config_last_modified{0};
-    std::atomic<int64_t> config_last_loaded{0};
+    std::thread          config_watch_thread;
+    std::atomic<bool>    config_watch_running{ false };
+    std::atomic<int64_t> config_last_modified{ 0 };
+    std::atomic<int64_t> config_last_loaded{ 0 };
 
     void update_meta(const std::string & name, const server_model_meta & meta);
 
@@ -119,7 +122,7 @@ private:
     // not thread-safe, caller must hold mutex
     void add_model(server_model_meta && meta);
 
-public:
+  public:
     server_models(const common_params & params, int argc, char ** argv, char ** envp);
     ~server_models();
 
@@ -160,29 +163,30 @@ public:
     bool ensure_model_loaded(const std::string & name);
 
     // proxy an HTTP request to the model instance
-    server_http_res_ptr proxy_request(const server_http_req & req, const std::string & method, const std::string & name, bool update_last_used);
+    server_http_res_ptr proxy_request(const server_http_req & req,
+                                      const std::string &     method,
+                                      const std::string &     name,
+                                      bool                    update_last_used);
 
     // notify the router server that a model instance is ready
     // return the monitoring thread (to be joined by the caller)
     static std::thread setup_child_server(const std::function<void(int)> & shutdown_handler);
 
     // get the last time the config file was loaded (unix timestamp)
-    int64_t get_config_last_loaded() const {
-        return config_last_loaded.load();
-    }
+    int64_t get_config_last_loaded() const { return config_last_loaded.load(); }
 
     // get the last time the config file was modified (unix timestamp)
-    int64_t get_config_last_modified() const {
-        return config_last_modified.load();
-    }
+    int64_t get_config_last_modified() const { return config_last_modified.load(); }
 };
 
 struct server_models_routes {
     common_params params;
-    json webui_settings = json::object();
+    json          webui_settings = json::object();
     server_models models;
-    server_models_routes(const common_params & params, int argc, char ** argv, char ** envp)
-            : params(params), models(params, argc, argv, envp) {
+
+    server_models_routes(const common_params & params, int argc, char ** argv, char ** envp) :
+        params(params),
+        models(params, argc, argv, envp) {
         if (!this->params.webui_config_json.empty()) {
             try {
                 webui_settings = json::parse(this->params.webui_config_json);
@@ -194,7 +198,7 @@ struct server_models_routes {
         init_routes();
     }
 
-    void init_routes();
+    void                           init_routes();
     // handlers using lambda function, so that they can capture `this` without `std::bind`
     server_http_context::handler_t get_router_props;
     server_http_context::handler_t get_router_metrics;
@@ -211,25 +215,27 @@ struct server_models_routes {
  */
 struct server_http_proxy : server_http_res {
     std::function<void()> cleanup = nullptr;
-public:
-    server_http_proxy(const std::string & method,
-                      const std::string & host,
-                      int port,
-                      const std::string & path,
+  public:
+    server_http_proxy(const std::string &                        method,
+                      const std::string &                        host,
+                      int                                        port,
+                      const std::string &                        path,
                       const std::map<std::string, std::string> & headers,
-                      const std::string & body,
-                      const std::function<bool()> should_stop);
+                      const std::string &                        body,
+                      const std::function<bool()>                should_stop);
+
     ~server_http_proxy() {
         if (cleanup) {
             cleanup();
         }
     }
-private:
+  private:
     std::thread thread;
+
     struct msg_t {
         std::map<std::string, std::string> headers;
-        int status = 0;
-        std::string data;
-        std::string content_type;
+        int                                status = 0;
+        std::string                        data;
+        std::string                        content_type;
     };
 };

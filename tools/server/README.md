@@ -204,6 +204,9 @@ For the ful list of features, please refer to [server's changelog](https://githu
 | `--models-preset PATH` | path to INI file containing model presets for the router server (default: disabled)<br/>(env: LLAMA_ARG_MODELS_PRESET) |
 | `--models-max N` | for router server, maximum number of models to load simultaneously (default: 4, 0 = unlimited)<br/>(env: LLAMA_ARG_MODELS_MAX) |
 | `--models-autoload, --no-models-autoload` | for router server, whether to automatically load models (default: enabled)<br/>(env: LLAMA_ARG_MODELS_AUTOLOAD) |
+| `--kv-cache-persist-path PATH` | for router server, directory to save KV cache when models are unloaded (default: disabled)<br/>(env: LLAMA_ARG_KV_CACHE_PERSIST_PATH) |
+| `--no-kv-cache-on-unload` | for router server, do not save KV cache when model is unloaded (default: save enabled)<br/>(env: LLAMA_ARG_KV_CACHE_ON_UNLOAD) |
+| `--no-kv-cache-on-load` | for router server, do not restore KV cache when model is loaded (default: restore enabled)<br/>(env: LLAMA_ARG_KV_CACHE_ON_LOAD) |
 | `--jinja, --no-jinja` | whether to use jinja template engine for chat (default: enabled)<br/>(env: LLAMA_ARG_JINJA) |
 | `--reasoning-format FORMAT` | controls whether thought tags are allowed and/or extracted from the response, and in which format they're returned; one of:<br/>- none: leaves thoughts unparsed in `message.content`<br/>- deepseek: puts thoughts in `message.reasoning_content`<br/>- deepseek-legacy: keeps `<think>` tags in `message.content` while also populating `message.reasoning_content`<br/>(default: auto)<br/>(env: LLAMA_ARG_THINK) |
 | `--reasoning-budget N` | controls the amount of thinking allowed; currently only one of: -1 for unrestricted thinking budget, or 0 to disable thinking (default: -1)<br/>(env: LLAMA_ARG_THINK_BUDGET) |
@@ -1573,6 +1576,9 @@ We also offer additional options that are exclusive to presets (these aren't tre
 - `load-on-startup` (boolean): Controls whether the model loads automatically when the server starts
 - `stop-timeout` (int, seconds): After requested unload, wait for this many seconds before forcing termination (default: 10)
 - `pin` (boolean): Prevents the router from unloading this model when the `models_max` limit is exceeded; the model remains loaded until explicitly unloaded or the server restarts.
+- `kv-cache-persist-path` (string): Directory to save KV cache when this model is unloaded. When the model is later reloaded, the KV cache will be restored. (default: empty, disabled)
+- `no-kv-cache-on-unload` (boolean): Disable saving KV cache when this model is unloaded (default: save enabled)
+- `no-kv-cache-on-load` (boolean): Disable restoring KV cache when this model is loaded (default: restore enabled)
 
 ### Routing requests
 
