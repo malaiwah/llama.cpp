@@ -493,6 +493,10 @@ struct server_metrics {
 struct server_context_impl {
     friend struct server_context;
 
+    server_context & ctx_server;
+
+    server_context_impl(server_context & ctx) : ctx_server(ctx) {}
+
   public:
     // only use these pointers outside of this class:
     //  - when not in sleeping state
@@ -805,47 +809,9 @@ struct server_context_impl {
 
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
 
+            // Load saved KV cache if configured
             if (!params_base.kv_cache_persist_path.empty()) {
-                const std::string & path = params_base.kv_cache_persist_path;
-                SRV_INF("%s: attempting to load KV cache from %s\n", __func__, path.c_str());
-
-                int loaded_count = 0;
-                int seq_id       = 0;
-
-                while (true) {
-                    std::string seq_path = path + ".seq" + std::to_string(seq_id);
-
-                    if (!std::filesystem::exists(seq_path)) {
-                        SRV_INF("%s: no more sequence files found (last checked: %s)\n", __func__, seq_path.c_str());
-                        break;
-                    }
-
-                    std::vector<llama_token> tokens;
-                    tokens.resize(n_ctx);
-                    size_t n_tokens = 0;
-
-                    size_t read = llama_state_seq_load_file(ctx, seq_path.c_str(), seq_id, tokens.data(), tokens.size(),
-                                                            &n_tokens);
-
-                    if (read > 0 && n_tokens > 0) {
-                        tokens.resize(n_tokens);
-                        loaded_count++;
-                        SRV_INF("%s: loaded sequence %d: %zu tokens, %zu bytes from %s\n", __func__, seq_id, n_tokens,
-                                read, seq_path.c_str());
-
-                        server_tokens stokens(tokens, false);
-                        server_prompt prompt;
-                        prompt.tokens = std::move(stokens);
-                        prompt_cache->states.push_back(std::move(prompt));
-                    } else {
-                        SRV_WRN("%s: failed to load sequence %d from %s, file may be invalid\n", __func__, seq_id,
-                                seq_path.c_str());
-                    }
-
-                    seq_id++;
-                }
-
-                SRV_INF("%s: loaded %d sequences into prompt cache\n", __func__, loaded_count);
+                ctx_server.load_kv_cache(params_base.kv_cache_persist_path);
             }
         } else {
             SRV_WRN("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
@@ -2873,7 +2839,7 @@ struct server_context_impl {
 // server_context (public API)
 //
 
-server_context::server_context() : impl(new server_context_impl()) {}
+server_context::server_context() : impl(new server_context_impl(*this)) {}
 
 server_context::~server_context() = default;
 
