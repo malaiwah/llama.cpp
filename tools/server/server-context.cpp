@@ -16,6 +16,7 @@
 #include <cinttypes>
 #include <cstddef>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <unordered_set>
 
@@ -31,6 +32,20 @@
 using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+// [AI] Add cache versioning and model hash validation
+struct CacheHeader {
+    uint32_t magic   = 0x4B564343;  // "KVCC" in hex
+    uint32_t version = 1;           // Cache format version
+    uint32_t model_hash;            // Hash of model file for validation
+    uint32_t reserved;              // Reserved for future use
+};
+
+// [AI] Calculate hash from model file path for cache validation
+static uint32_t calculate_model_hash(const std::string & model_path) {
+    std::hash<std::string> hasher;
+    return static_cast<uint32_t>(hasher(model_path));
+}
 
 // state diagram: https://github.com/ggml-org/llama.cpp/pull/9283
 enum slot_state {
@@ -2932,6 +2947,9 @@ bool server_context::save_kv_cache(const std::string & path) {
         return false;
     }
 
+    // [AI] Calculate model hash for cache validation
+    uint32_t model_hash = calculate_model_hash(impl->params_base.model.path);
+
     int seq_id      = 0;
     int saved_count = 0;
 
@@ -2942,15 +2960,50 @@ bool server_context::save_kv_cache(const std::string & path) {
 
         std::string seq_path = path + ".seq" + std::to_string(seq_id);
 
-        size_t written = llama_state_seq_save_file(ctx, seq_path.c_str(), seq_id, state.tokens.get_text_tokens().data(),
+        // [AI] Write cache header before sequence data using atomic write pattern
+        std::string tmp_path = seq_path + ".tmp";
+        CacheHeader header;
+        header.magic      = 0x4B564343;  // "KVCC"
+        header.version    = 1;
+        header.model_hash = model_hash;
+        header.reserved   = 0;
+
+        std::ofstream out(tmp_path, std::ios::binary);
+        if (!out) {
+            SRV_WRN("%s: failed to open temp file %s for writing\n", __func__, tmp_path.c_str());
+            seq_id++;
+            continue;
+        }
+
+        out.write(reinterpret_cast<const char *>(&header), sizeof(CacheHeader));
+        if (!out) {
+            SRV_WRN("%s: failed to write header to %s\n", __func__, tmp_path.c_str());
+            out.close();
+            seq_id++;
+            continue;
+        }
+
+        size_t written = llama_state_seq_save_file(ctx, tmp_path.c_str(), seq_id, state.tokens.get_text_tokens().data(),
                                                    state.tokens.size());
 
+        out.close();
+
         if (written > 0) {
+            std::error_code ec;
+            std::filesystem::rename(tmp_path, seq_path, ec);
+            if (ec) {
+                SRV_WRN("%s: failed to rename temp file to %s: %s\n", __func__, seq_path.c_str(), ec.message().c_str());
+                std::filesystem::remove(tmp_path, ec);
+                seq_id++;
+                continue;
+            }
             saved_count++;
             SRV_INF("%s: saved sequence %d: %d tokens, %zu bytes to %s\n", __func__, seq_id, state.n_tokens(), written,
                     seq_path.c_str());
         } else {
             SRV_WRN("%s: failed to save sequence %d\n", __func__, seq_id);
+            std::error_code ec;
+            std::filesystem::remove(tmp_path, ec);
         }
 
         seq_id++;
@@ -2974,6 +3027,9 @@ bool server_context::load_kv_cache(const std::string & path) {
         return false;
     }
 
+    // [AI] Calculate current model hash for validation
+    uint32_t current_model_hash = calculate_model_hash(impl->params_base.model.path);
+
     int       loaded_count = 0;
     int       seq_id       = 0;
     const int n_ctx        = llama_n_ctx(ctx);
@@ -2992,6 +3048,54 @@ bool server_context::load_kv_cache(const std::string & path) {
         auto            file_size = std::filesystem::file_size(seq_path, ec);
         if (ec || file_size == 0) {
             SRV_WRN("%s: skipping empty or invalid sequence file %s\n", __func__, seq_path.c_str());
+            seq_id++;
+            continue;
+        }
+
+        // [AI] Read and validate cache header
+        if (file_size < sizeof(CacheHeader)) {
+            SRV_WRN("%s: skipping sequence file %s: file too small to contain valid header\n", __func__,
+                    seq_path.c_str());
+            seq_id++;
+            continue;
+        }
+
+        CacheHeader   header;
+        std::ifstream in(seq_path, std::ios::binary);
+        if (!in) {
+            SRV_WRN("%s: failed to open sequence file %s for reading\n", __func__, seq_path.c_str());
+            seq_id++;
+            continue;
+        }
+
+        in.read(reinterpret_cast<char *>(&header), sizeof(CacheHeader));
+        if (!in) {
+            SRV_WRN("%s: failed to read header from %s\n", __func__, seq_path.c_str());
+            seq_id++;
+            continue;
+        }
+        in.close();
+
+        // [AI] Validate magic number
+        if (header.magic != 0x4B564343) {
+            SRV_WRN("%s: skipping sequence file %s: invalid magic number (expected 0x4B564343, got 0x%08X)\n", __func__,
+                    seq_path.c_str(), header.magic);
+            seq_id++;
+            continue;
+        }
+
+        // [AI] Validate version
+        if (header.version != 1) {
+            SRV_WRN("%s: skipping sequence file %s: unsupported version %d (only version 1 is supported)\n", __func__,
+                    seq_path.c_str(), header.version);
+            seq_id++;
+            continue;
+        }
+
+        // [AI] Validate model hash
+        if (header.model_hash != current_model_hash) {
+            SRV_WRN("%s: skipping sequence file %s: model hash mismatch (cache: 0x%08X, current: 0x%08X)\n", __func__,
+                    seq_path.c_str(), header.model_hash, current_model_hash);
             seq_id++;
             continue;
         }
