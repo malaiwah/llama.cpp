@@ -400,8 +400,10 @@ void server_models::unload_lru() {
                 return mapping[lru_model_name].meta.status == SERVER_MODEL_STATUS_UNLOADED;
             });
         }
-    } else if (count_active >= (size_t)base_params.models_max) {
-        SRV_WRN("models_max limit reached, but no unpinned models available for LRU eviction - automatic unload cannot succeed\n");
+    } else if (count_active >= (size_t) base_params.models_max) {
+        SRV_WRN(
+            "models_max limit reached, but no unpinned models available for LRU eviction - automatic unload cannot "
+            "succeed\n");
     }
 }
 
@@ -674,8 +676,9 @@ server_http_res_ptr server_models::proxy_request(const server_http_req & req,
         mapping[name].meta.last_used = ggml_time_ms();
     }
     SRV_INF("proxying request to model %s on port %d\n", name.c_str(), meta->port);
-    auto proxy = std::make_unique<server_http_proxy>(method, CHILD_ADDR, meta->port, req.path, req.headers, req.body,
-                                                     req.should_stop);
+    auto proxy =
+        std::make_unique<server_http_proxy>(method, CHILD_ADDR, meta->port, req.path, req.headers, req.body,
+                                            req.should_stop, base_params.timeout_read, base_params.timeout_write);
     return proxy;
 }
 
@@ -970,7 +973,9 @@ server_http_proxy::server_http_proxy(const std::string &                        
                                      const std::string &                        path,
                                      const std::map<std::string, std::string> & headers,
                                      const std::string &                        body,
-                                     const std::function<bool()>                should_stop) {
+                                     const std::function<bool()>                should_stop,
+                                     int32_t                                    timeout_read,
+                                     int32_t                                    timeout_write) {
     // shared between reader and writer threads
     auto cli  = std::make_shared<httplib::Client>(host, port);
     auto pipe = std::make_shared<pipe_t<msg_t>>();
