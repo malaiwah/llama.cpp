@@ -1,23 +1,23 @@
-#include "server-context.h"
-#include "server-http.h"
-#include "server-models.h"
-
 #include "arg.h"
 #include "common.h"
 #include "llama.h"
 #include "log.h"
+#include "server-context.h"
+#include "server-http.h"
+#include "server-models.h"
+
+#include <signal.h>
 
 #include <atomic>
 #include <exception>
-#include <signal.h>
-#include <thread> // for std::thread::hardware_concurrency
+#include <thread>  // for std::thread::hardware_concurrency
 
 #if defined(_WIN32)
-#include <windows.h>
+#    include <windows.h>
 #endif
 
 static std::function<void(int)> shutdown_handler;
-static std::atomic_flag is_terminating = ATOMIC_FLAG_INIT;
+static std::atomic_flag         is_terminating = ATOMIC_FLAG_INIT;
 
 static inline void signal_handler(int signal) {
     if (is_terminating.test_and_set()) {
@@ -35,28 +35,30 @@ static inline void signal_handler(int signal) {
 static server_http_context::handler_t ex_wrapper(server_http_context::handler_t func) {
     return [func = std::move(func)](const server_http_req & req) -> server_http_res_ptr {
         std::string message;
-        error_type error;
+        error_type  error;
         try {
             return func(req);
         } catch (const std::invalid_argument & e) {
             // treat invalid_argument as invalid request (400)
-            error = ERROR_TYPE_INVALID_REQUEST;
+            error   = ERROR_TYPE_INVALID_REQUEST;
             message = e.what();
         } catch (const std::exception & e) {
             // treat other exceptions as server error (500)
-            error = ERROR_TYPE_SERVER;
+            error   = ERROR_TYPE_SERVER;
             message = e.what();
         } catch (...) {
-            error = ERROR_TYPE_SERVER;
+            error   = ERROR_TYPE_SERVER;
             message = "unknown error";
         }
 
-        auto res = std::make_unique<server_http_res>();
+        auto res    = std::make_unique<server_http_res>();
         res->status = 500;
         try {
             json error_data = format_error_response(message, error);
-            res->status = json_value(error_data, "code", 500);
-            res->data = safe_json_to_str({{ "error", error_data }});
+            res->status     = json_value(error_data, "code", 500);
+            res->data       = safe_json_to_str({
+                { "error", error_data }
+            });
             SRV_WRN("got exception: %s\n", res->data.c_str());
         } catch (const std::exception & e) {
             SRV_ERR("got another exception: %s | while handling exception: %s\n", e.what(), message.c_str());
@@ -78,7 +80,8 @@ int main(int argc, char ** argv, char ** envp) {
     // embeddings require all tokens to be processed in a single ubatch
     // see https://github.com/ggml-org/llama.cpp/issues/12836
     if (params.embedding && params.n_batch > params.n_ubatch) {
-        LOG_WRN("%s: embeddings enabled with n_batch (%d) > n_ubatch (%d)\n", __func__, params.n_batch, params.n_ubatch);
+        LOG_WRN("%s: embeddings enabled with n_batch (%d) > n_ubatch (%d)\n", __func__, params.n_batch,
+                params.n_ubatch);
         LOG_WRN("%s: setting n_batch = n_ubatch = %d to avoid assertion failure\n", __func__, params.n_ubatch);
         params.n_batch = params.n_ubatch;
     }
@@ -103,7 +106,8 @@ int main(int argc, char ** argv, char ** envp) {
     llama_backend_init();
     llama_numa_init(params.numa);
 
-    LOG_INF("system info: n_threads = %d, n_threads_batch = %d, total_threads = %d\n", params.cpuparams.n_threads, params.cpuparams_batch.n_threads, std::thread::hardware_concurrency());
+    LOG_INF("system info: n_threads = %d, n_threads_batch = %d, total_threads = %d\n", params.cpuparams.n_threads,
+            params.cpuparams_batch.n_threads, std::thread::hardware_concurrency());
     LOG_INF("\n");
     LOG_INF("%s\n", common_params_get_system_info(params).c_str());
     LOG_INF("\n");
@@ -121,7 +125,7 @@ int main(int argc, char ** argv, char ** envp) {
     // register API routes
     server_routes routes(params, ctx_server);
 
-    bool is_router_server = params.model.path.empty();
+    bool                                is_router_server = params.model.path.empty();
     std::optional<server_models_routes> models_routes{};
     if (is_router_server) {
         // setup server instances manager
@@ -157,44 +161,46 @@ int main(int argc, char ** argv, char ** envp) {
         // custom routes for router
         routes.get_props  = models_routes->get_router_props;
         routes.get_models = models_routes->get_router_models;
-        ctx_http.post("/models/load",   ex_wrapper(models_routes->post_router_models_load));
+        ctx_http.post("/models/load", ex_wrapper(models_routes->post_router_models_load));
         ctx_http.post("/models/unload", ex_wrapper(models_routes->post_router_models_unload));
     }
 
-    ctx_http.get ("/health",              ex_wrapper(routes.get_health)); // public endpoint (no API key check)
-    ctx_http.get ("/v1/health",           ex_wrapper(routes.get_health)); // public endpoint (no API key check)
-    ctx_http.get ("/metrics",             ex_wrapper(routes.get_metrics));
-    ctx_http.get ("/props",               ex_wrapper(routes.get_props));
-    ctx_http.post("/props",               ex_wrapper(routes.post_props));
-    ctx_http.post("/api/show",            ex_wrapper(routes.get_api_show));
-    ctx_http.get ("/models",              ex_wrapper(routes.get_models)); // public endpoint (no API key check)
-    ctx_http.get ("/v1/models",           ex_wrapper(routes.get_models)); // public endpoint (no API key check)
-    ctx_http.get ("/api/tags",            ex_wrapper(routes.get_models)); // ollama specific endpoint. public endpoint (no API key check)
-    ctx_http.post("/completion",          ex_wrapper(routes.post_completions)); // legacy
-    ctx_http.post("/completions",         ex_wrapper(routes.post_completions));
-    ctx_http.post("/v1/completions",      ex_wrapper(routes.post_completions_oai));
-    ctx_http.post("/chat/completions",    ex_wrapper(routes.post_chat_completions));
+    ctx_http.get("/health", ex_wrapper(routes.get_health));     // public endpoint (no API key check)
+    ctx_http.get("/v1/health", ex_wrapper(routes.get_health));  // public endpoint (no API key check)
+    ctx_http.get("/metrics", ex_wrapper(routes.get_metrics));
+    ctx_http.get("/props", ex_wrapper(routes.get_props));
+    ctx_http.post("/props", ex_wrapper(routes.post_props));
+    ctx_http.post("/api/show", ex_wrapper(routes.get_api_show));
+    ctx_http.get("/models", ex_wrapper(routes.get_models));     // public endpoint (no API key check)
+    ctx_http.get("/v1/models", ex_wrapper(routes.get_models));  // public endpoint (no API key check)
+    ctx_http.get("/api/tags",
+                 ex_wrapper(routes.get_models));  // ollama specific endpoint. public endpoint (no API key check)
+    ctx_http.post("/completion", ex_wrapper(routes.post_completions));  // legacy
+    ctx_http.post("/completions", ex_wrapper(routes.post_completions));
+    ctx_http.post("/v1/completions", ex_wrapper(routes.post_completions_oai));
+    ctx_http.post("/chat/completions", ex_wrapper(routes.post_chat_completions));
     ctx_http.post("/v1/chat/completions", ex_wrapper(routes.post_chat_completions));
-    ctx_http.post("/api/chat",            ex_wrapper(routes.post_chat_completions)); // ollama specific endpoint
-    ctx_http.post("/v1/messages",         ex_wrapper(routes.post_anthropic_messages)); // anthropic messages API
-    ctx_http.post("/v1/messages/count_tokens", ex_wrapper(routes.post_anthropic_count_tokens)); // anthropic token counting
-    ctx_http.post("/infill",              ex_wrapper(routes.post_infill));
-    ctx_http.post("/embedding",           ex_wrapper(routes.post_embeddings)); // legacy
-    ctx_http.post("/embeddings",          ex_wrapper(routes.post_embeddings));
-    ctx_http.post("/v1/embeddings",       ex_wrapper(routes.post_embeddings_oai));
-    ctx_http.post("/rerank",              ex_wrapper(routes.post_rerank));
-    ctx_http.post("/reranking",           ex_wrapper(routes.post_rerank));
-    ctx_http.post("/v1/rerank",           ex_wrapper(routes.post_rerank));
-    ctx_http.post("/v1/reranking",        ex_wrapper(routes.post_rerank));
-    ctx_http.post("/tokenize",            ex_wrapper(routes.post_tokenize));
-    ctx_http.post("/detokenize",          ex_wrapper(routes.post_detokenize));
-    ctx_http.post("/apply-template",      ex_wrapper(routes.post_apply_template));
+    ctx_http.post("/api/chat", ex_wrapper(routes.post_chat_completions));       // ollama specific endpoint
+    ctx_http.post("/v1/messages", ex_wrapper(routes.post_anthropic_messages));  // anthropic messages API
+    ctx_http.post("/v1/messages/count_tokens",
+                  ex_wrapper(routes.post_anthropic_count_tokens));              // anthropic token counting
+    ctx_http.post("/infill", ex_wrapper(routes.post_infill));
+    ctx_http.post("/embedding", ex_wrapper(routes.post_embeddings));            // legacy
+    ctx_http.post("/embeddings", ex_wrapper(routes.post_embeddings));
+    ctx_http.post("/v1/embeddings", ex_wrapper(routes.post_embeddings_oai));
+    ctx_http.post("/rerank", ex_wrapper(routes.post_rerank));
+    ctx_http.post("/reranking", ex_wrapper(routes.post_rerank));
+    ctx_http.post("/v1/rerank", ex_wrapper(routes.post_rerank));
+    ctx_http.post("/v1/reranking", ex_wrapper(routes.post_rerank));
+    ctx_http.post("/tokenize", ex_wrapper(routes.post_tokenize));
+    ctx_http.post("/detokenize", ex_wrapper(routes.post_detokenize));
+    ctx_http.post("/apply-template", ex_wrapper(routes.post_apply_template));
     // LoRA adapters hotswap
-    ctx_http.get ("/lora-adapters",       ex_wrapper(routes.get_lora_adapters));
-    ctx_http.post("/lora-adapters",       ex_wrapper(routes.post_lora_adapters));
+    ctx_http.get("/lora-adapters", ex_wrapper(routes.get_lora_adapters));
+    ctx_http.post("/lora-adapters", ex_wrapper(routes.post_lora_adapters));
     // Save & load slots
-    ctx_http.get ("/slots",               ex_wrapper(routes.get_slots));
-    ctx_http.post("/slots/:id_slot",      ex_wrapper(routes.post_slots));
+    ctx_http.get("/slots", ex_wrapper(routes.get_slots));
+    ctx_http.post("/slots/:id_slot", ex_wrapper(routes.post_slots));
 
     //
     // Start the server
@@ -258,20 +264,25 @@ int main(int argc, char ** argv, char ** envp) {
         LOG_INF("%s: model loaded\n", __func__);
 
         shutdown_handler = [&](int) {
+            // Save KV cache before shutdown if configured
+            if (!params.kv_cache_persist_path.empty()) {
+                SRV_INF("%s: saving KV cache to %s before shutdown\n", __func__, params.kv_cache_persist_path.c_str());
+                ctx_server.save_kv_cache(params.kv_cache_persist_path);
+            }
             // this will unblock start_loop()
             ctx_server.terminate();
         };
     }
 
     // TODO: refactor in common/console
-#if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
+#if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
     struct sigaction sigint_action;
     sigint_action.sa_handler = signal_handler;
-    sigemptyset (&sigint_action.sa_mask);
+    sigemptyset(&sigint_action.sa_mask);
     sigint_action.sa_flags = 0;
     sigaction(SIGINT, &sigint_action, NULL);
     sigaction(SIGTERM, &sigint_action, NULL);
-#elif defined (_WIN32)
+#elif defined(_WIN32)
     auto console_ctrl_handler = +[](DWORD ctrl_type) -> BOOL {
         return (ctrl_type == CTRL_C_EVENT) ? (signal_handler(SIGINT), true) : false;
     };
@@ -283,7 +294,7 @@ int main(int argc, char ** argv, char ** envp) {
         LOG_INF("%s: NOTE: router mode is experimental\n", __func__);
         LOG_INF("%s:       it is not recommended to use this mode in untrusted environments\n", __func__);
         if (ctx_http.thread.joinable()) {
-            ctx_http.thread.join(); // keep the main thread alive
+            ctx_http.thread.join();  // keep the main thread alive
         }
 
         // when the HTTP server stops, clean up and exit
@@ -294,7 +305,7 @@ int main(int argc, char ** argv, char ** envp) {
 
         // optionally, notify router server that this instance is ready
         const char * router_port = std::getenv("LLAMA_SERVER_ROUTER_PORT");
-        std::thread monitor_thread;
+        std::thread  monitor_thread;
         if (router_port != nullptr) {
             monitor_thread = server_models::setup_child_server(shutdown_handler);
         }
