@@ -431,6 +431,12 @@ void server_models::load(const std::string & name) {
         // [AI] Add KV cache path to environment if configured
         std::string kv_cache_path;
         if (inst.meta.preset.get_option(COMMON_ARG_PRESET_KV_CACHE_PERSIST_PATH, kv_cache_path)) {
+            // [AI] Perform variable substitution in KV cache path
+            // Supported variables: {model_name}, {model_alias}
+            std::string model_name = inst.meta.name;
+            string_replace_all(kv_cache_path, "{model_name}", model_name);
+            string_replace_all(kv_cache_path, "{model_alias}", model_name);
+
             child_env.push_back("LLAMA_ARG_KV_CACHE_PERSIST_PATH=" + kv_cache_path);
         }
 
