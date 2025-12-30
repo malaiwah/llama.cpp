@@ -2950,60 +2950,70 @@ bool server_context::save_kv_cache(const std::string & path) {
     // [AI] Calculate model hash for cache validation
     uint32_t model_hash = calculate_model_hash(impl->params_base.model.path);
 
+    // [AI] Save metadata to separate file
+    std::string meta_path = path + ".meta";
+    CacheHeader header;
+    header.magic      = 0x4B564343;  // "KVCC"
+    header.version    = 1;
+    header.model_hash = model_hash;
+    header.reserved   = 0;
+
+    {
+        std::ofstream meta_out(meta_path, std::ios::binary);
+        if (!meta_out) {
+            SRV_ERR("%s: failed to open metadata file %s for writing\n", __func__, meta_path.c_str());
+            return false;
+        }
+        meta_out.write(reinterpret_cast<const char *>(&header), sizeof(CacheHeader));
+        if (!meta_out) {
+            SRV_ERR("%s: failed to write metadata to %s\n", __func__, meta_path.c_str());
+            return false;
+        }
+        SRV_INF("%s: saved metadata to %s\n", __func__, meta_path.c_str());
+    }
+
     int seq_id      = 0;
     int saved_count = 0;
+
+    // [AI] Find an available slot to use for saving KV state
+    server_slot * slot_for_save = nullptr;
+    for (auto & slot : impl->slots) {
+        if (slot.state == SLOT_STATE_IDLE) {
+            slot_for_save = &slot;
+            break;
+        }
+    }
+
+    if (!slot_for_save) {
+        SRV_WRN("%s: no available slot for saving KV cache\n", __func__);
+        return false;
+    }
+
+    const llama_seq_id save_seq_id = slot_for_save->id;
 
     for (const auto & state : cache->states) {
         if (state.data.empty()) {
             continue;
         }
 
+        // [AI] Load prompt into slot to get KV state
+        llama_memory_seq_rm(llama_get_memory(ctx), save_seq_id, -1, -1);  // Clear slot
+
+        // Load KV state from prompt cache into slot
+        llama_state_seq_set_data(ctx, state.data.data(), state.data.size(), save_seq_id);
+
         std::string seq_path = path + ".seq" + std::to_string(seq_id);
 
-        // [AI] Write cache header before sequence data using atomic write pattern
-        std::string tmp_path = seq_path + ".tmp";
-        CacheHeader header;
-        header.magic      = 0x4B564343;  // "KVCC"
-        header.version    = 1;
-        header.model_hash = model_hash;
-        header.reserved   = 0;
-
-        std::ofstream out(tmp_path, std::ios::binary);
-        if (!out) {
-            SRV_WRN("%s: failed to open temp file %s for writing\n", __func__, tmp_path.c_str());
-            seq_id++;
-            continue;
-        }
-
-        out.write(reinterpret_cast<const char *>(&header), sizeof(CacheHeader));
-        if (!out) {
-            SRV_WRN("%s: failed to write header to %s\n", __func__, tmp_path.c_str());
-            out.close();
-            seq_id++;
-            continue;
-        }
-
-        size_t written = llama_state_seq_save_file(ctx, tmp_path.c_str(), seq_id, state.tokens.get_text_tokens().data(),
+        // [AI] Save sequence from slot (now has KV state)
+        size_t written = llama_state_seq_save_file(ctx, seq_path.c_str(), 0, state.tokens.get_text_tokens().data(),
                                                    state.tokens.size());
 
-        out.close();
-
         if (written > 0) {
-            std::error_code ec;
-            std::filesystem::rename(tmp_path, seq_path, ec);
-            if (ec) {
-                SRV_WRN("%s: failed to rename temp file to %s: %s\n", __func__, seq_path.c_str(), ec.message().c_str());
-                std::filesystem::remove(tmp_path, ec);
-                seq_id++;
-                continue;
-            }
             saved_count++;
             SRV_INF("%s: saved sequence %d: %d tokens, %zu bytes to %s\n", __func__, seq_id, state.n_tokens(), written,
                     seq_path.c_str());
         } else {
             SRV_WRN("%s: failed to save sequence %d\n", __func__, seq_id);
-            std::error_code ec;
-            std::filesystem::remove(tmp_path, ec);
         }
 
         seq_id++;
@@ -3030,11 +3040,64 @@ bool server_context::load_kv_cache(const std::string & path) {
     // [AI] Calculate current model hash for validation
     uint32_t current_model_hash = calculate_model_hash(impl->params_base.model.path);
 
-    int       loaded_count = 0;
-    int       seq_id       = 0;
-    const int n_ctx        = llama_n_ctx(ctx);
+    // [AI] Read and validate metadata file
+    std::string meta_path = path + ".meta";
+    if (!std::filesystem::exists(meta_path)) {
+        SRV_INF("%s: no metadata file found at %s, skipping cache load\n", __func__, meta_path.c_str());
+        return false;
+    }
+
+    CacheHeader header;
+    {
+        std::ifstream meta_in(meta_path, std::ios::binary);
+        if (!meta_in) {
+            SRV_WRN("%s: failed to open metadata file %s for reading\n", __func__, meta_path.c_str());
+            return false;
+        }
+        meta_in.read(reinterpret_cast<char *>(&header), sizeof(CacheHeader));
+        if (!meta_in) {
+            SRV_WRN("%s: failed to read metadata from %s\n", __func__, meta_path.c_str());
+            return false;
+        }
+    }
+
+    // [AI] Validate magic number
+    if (header.magic != 0x4B564343) {
+        SRV_WRN("%s: invalid metadata magic number (expected 0x4B564343, got 0x%08X)\n", __func__, header.magic);
+        return false;
+    }
+
+    // [AI] Validate version
+    if (header.version != 1) {
+        SRV_WRN("%s: unsupported cache version %d (only version 1 is supported)\n", __func__, header.version);
+        return false;
+    }
+
+    // [AI] Validate model hash
+    if (header.model_hash != current_model_hash) {
+        SRV_WRN("%s: model hash mismatch (cache: 0x%08X, current: 0x%08X), skipping cache load\n", __func__,
+                header.model_hash, current_model_hash);
+        return false;
+    }
+
+    int loaded_count = 0;
+    int seq_id       = 0;
 
     const auto t_start = ggml_time_ms();
+
+    // [AI] Find an available slot to use for loading KV state
+    server_slot * slot_for_load = nullptr;
+    for (auto & slot : impl->slots) {
+        if (slot.state == SLOT_STATE_IDLE) {
+            slot_for_load = &slot;
+            break;
+        }
+    }
+
+    if (!slot_for_load) {
+        SRV_WRN("%s: no available slot for loading KV cache\n", __func__);
+        return false;
+    }
 
     while (true) {
         std::string seq_path = path + ".seq" + std::to_string(seq_id);
@@ -3052,73 +3115,44 @@ bool server_context::load_kv_cache(const std::string & path) {
             continue;
         }
 
-        // [AI] Read and validate cache header
-        if (file_size < sizeof(CacheHeader)) {
-            SRV_WRN("%s: skipping sequence file %s: file too small to contain valid header\n", __func__,
-                    seq_path.c_str());
+        // [AI] Load KV state into the slot
+        const llama_seq_id       load_seq_id = slot_for_load->id;
+        std::vector<llama_token> token_buffer(40960);  // Max context size
+        size_t                   n_tokens = 0;
+
+        size_t read = llama_state_seq_load_file(ctx, seq_path.c_str(), load_seq_id, token_buffer.data(),
+                                                token_buffer.size(), &n_tokens);
+        if (read == 0) {
+            SRV_WRN("%s: failed to load sequence %d from %s\n", __func__, seq_id, seq_path.c_str());
             seq_id++;
             continue;
         }
 
-        CacheHeader   header;
-        std::ifstream in(seq_path, std::ios::binary);
-        if (!in) {
-            SRV_WRN("%s: failed to open sequence file %s for reading\n", __func__, seq_path.c_str());
-            seq_id++;
-            continue;
-        }
+        token_buffer.resize(n_tokens);
 
-        in.read(reinterpret_cast<char *>(&header), sizeof(CacheHeader));
-        if (!in) {
-            SRV_WRN("%s: failed to read header from %s\n", __func__, seq_path.c_str());
-            seq_id++;
-            continue;
-        }
-        in.close();
+        // [AI] Extract tokens from the slot (they should match what we loaded)
+        std::vector<llama_token> tokens = token_buffer;
 
-        // [AI] Validate magic number
-        if (header.magic != 0x4B564343) {
-            SRV_WRN("%s: skipping sequence file %s: invalid magic number (expected 0x4B564343, got 0x%08X)\n", __func__,
-                    seq_path.c_str(), header.magic);
-            seq_id++;
-            continue;
-        }
-
-        // [AI] Validate version
-        if (header.version != 1) {
-            SRV_WRN("%s: skipping sequence file %s: unsupported version %d (only version 1 is supported)\n", __func__,
-                    seq_path.c_str(), header.version);
-            seq_id++;
-            continue;
-        }
-
-        // [AI] Validate model hash
-        if (header.model_hash != current_model_hash) {
-            SRV_WRN("%s: skipping sequence file %s: model hash mismatch (cache: 0x%08X, current: 0x%08X)\n", __func__,
-                    seq_path.c_str(), header.model_hash, current_model_hash);
-            seq_id++;
-            continue;
-        }
-
-        std::vector<llama_token> tokens;
-        tokens.resize(n_ctx);
-        size_t n_tokens = 0;
-
-        size_t read = llama_state_seq_load_file(ctx, seq_path.c_str(), seq_id, tokens.data(), tokens.size(), &n_tokens);
-
-        if (read > 0 && n_tokens > 0) {
-            tokens.resize(n_tokens);
-            loaded_count++;
-            SRV_INF("%s: loaded sequence %d: %zu tokens, %zu bytes from %s\n", __func__, seq_id, n_tokens, read,
-                    seq_path.c_str());
-
+        if (n_tokens > 0) {
+            // [AI] Save the KV state to prompt cache
             server_tokens stokens(tokens, false);
             server_prompt prompt;
             prompt.tokens = std::move(stokens);
-            impl->prompt_cache->states.push_back(std::move(prompt));
+
+            // Allocate space in prompt cache and copy KV state from the slot
+            const size_t state_size = llama_state_seq_get_size_ext(ctx, load_seq_id, 0);
+            auto *       cur        = impl->prompt_cache->alloc(prompt, state_size);
+            if (cur != nullptr) {
+                llama_state_seq_get_data_ext(ctx, cur->data.data(), state_size, load_seq_id, 0);
+
+                loaded_count++;
+                SRV_INF("%s: loaded sequence %d: %zu tokens, %.3f MiB from %s\n", __func__, seq_id, n_tokens,
+                        state_size / (1024.0 * 1024.0), seq_path.c_str());
+            } else {
+                SRV_WRN("%s: failed to allocate space in prompt cache for sequence %d\n", __func__, seq_id);
+            }
         } else {
-            SRV_WRN("%s: failed to load sequence %d from %s, file may be invalid\n", __func__, seq_id,
-                    seq_path.c_str());
+            SRV_WRN("%s: sequence %d has no tokens\n", __func__, seq_id);
         }
 
         seq_id++;

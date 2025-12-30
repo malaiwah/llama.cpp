@@ -264,9 +264,8 @@ int main(int argc, char ** argv, char ** envp) {
         LOG_INF("%s: model loaded\n", __func__);
 
         shutdown_handler = [&](int) {
-            // Save KV cache before shutdown if configured and running as child process
-            const char * router_port = std::getenv("LLAMA_SERVER_ROUTER_PORT");
-            if (router_port != nullptr && !params.kv_cache_persist_path.empty()) {
+            // Save KV cache before shutdown if configured
+            if (!params.kv_cache_persist_path.empty()) {
                 SRV_INF("%s: saving KV cache to %s before shutdown\n", __func__, params.kv_cache_persist_path.c_str());
                 ctx_server.save_kv_cache(params.kv_cache_persist_path);
             }

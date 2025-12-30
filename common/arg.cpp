@@ -3123,6 +3123,13 @@ common_params_context common_params_parser_init(common_params & params,
                        })
                 .set_examples({ LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI }));
 
+    // [AI] KV cache persistence for CLI and server
+    add_opt(common_arg({ "--kv-cache-persist-path" }, "PATH",
+                       "path to save/load KV cache state (empty = disabled, saved on exit)",
+                       [](common_params & params, const std::string & value) { params.kv_cache_persist_path = value; })
+                .set_env(COMMON_ARG_PRESET_KV_CACHE_PERSIST_PATH)
+                .set_examples({ LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI }));
+
     return ctx_arg;
 }
 
@@ -3138,13 +3145,6 @@ void common_params_add_preset_options(std::vector<common_arg> & args) {
                    "in server router mode, force-kill model instance after this many seconds of graceful shutdown",
                    [](common_params &, int) { /* unused */ })
             .set_env(COMMON_ARG_PRESET_STOP_TIMEOUT)
-            .set_preset_only());
-
-    args.push_back(
-        common_arg({ "kv-cache-persist-path" }, "PATH",
-                   "path to save/load KV cache state for router mode (empty = disabled)",
-                   [](common_params & params, const std::string & value) { params.kv_cache_persist_path = value; })
-            .set_env(COMMON_ARG_PRESET_KV_CACHE_PERSIST_PATH)
             .set_preset_only());
 
     // args.push_back(common_arg(
